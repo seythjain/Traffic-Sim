@@ -1,6 +1,10 @@
 from utils import randomGraph
 import random
 import torch
+import csv
+
+DIR_NAMES = ["Left", "Right", "Forward", "Backward"]
+
 
 class IntersectionManyWay:
     def __init__(self, id=0, Directions=None, threshold=0, waitTotal=0,
@@ -54,12 +58,11 @@ class IntersectionManyWay:
                 red["wait_score"] = red["waiting_cars"] * (red["red_duration"] ** 2)
 
 
-def build_city(v, e, seed=None):
-    if seed is not None:
-        random.seed(seed)
-    graph = randomGraph(v, e)
-    intersections = {i: IntersectionManyWay(id=i, threshold=0) for i in range(v)}
-    DIR_NAMES = ["Left", "Right", "Forward", "Backward"]
+def build_city_from_graph(graph, v, thresholds):
+    """Build intersections wired according to a FIXED graph, with given
+    per-intersection thresholds. Reused across configs so the comparison
+    is apples-to-apples (same road layout, different threshold policy)."""
+    intersections = {i: IntersectionManyWay(id=i, threshold=float(thresholds[i])) for i in range(v)}
     used = {i: 0 for i in range(v)}
     for start in graph:
         for end in graph[start]:
@@ -72,55 +75,102 @@ def build_city(v, e, seed=None):
     return intersections
 
 
-def total_wait(thresholds, v, e, steps=100, seed=None):
-    """Run the city sim with given per-intersection thresholds, return total wait."""
-    city = build_city(v, e, seed=seed)
-    for i, inter in city.items():
-        inter.threshold = max(0.0, float(thresholds[i]))
+def run_sim(graph, v, thresholds, steps, seed=None):
+    if seed is not None:
+        random.seed(seed)
+    city = build_city_from_graph(graph, v, thresholds)
     for _ in range(steps):
-        for inter in city.values():
-            inter.timestep()
-    return sum(inter.waitTotal for inter in city.values())
+        for node in city.values():
+            node.timestep()
+    total_wait = sum(node.waitTotal for node in city.values())
+    total_ts = sum(node.ts for node in city.values())
+    avg_wait = total_wait / total_ts if total_ts else 0
+    return total_wait, avg_wait
 
 
 class ESOptimizer:
-    """Evolution Strategies: treats `mean` as the learnable thresholds,
-    estimates a gradient via random perturbations (since the sim itself
-    isn't differentiable), and lets torch.optim do the update."""
-    def __init__(self, v, e, lr=2.0, sigma=5.0, pop_size=30, steps=100):
-        self.v, self.e, self.steps = v, e, steps
+    """Evolution Strategies optimizer, scoped to ONE fixed graph."""
+    def __init__(self, graph, v, lr=1.0, sigma=3.0, pop_size=20, steps=200):
+        self.graph, self.v, self.steps = graph, v, steps
         self.sigma, self.pop_size = sigma, pop_size
         self.mean = torch.full((v,), 10.0, requires_grad=True)
         self.optimizer = torch.optim.Adam([self.mean], lr=lr)
 
-    def step(self, seeds=(1, 2, 3)):
-        # the sim is very high-variance (x*c^x amplifies random noise), so
-        # each candidate is scored as an AVERAGE over several seeds instead
-        # of one run - otherwise the "gradient" is mostly just noise
+    def step(self, seeds=(1, 2)):
         noise = torch.randn(self.pop_size, self.v)
         rewards = torch.zeros(self.pop_size)
         for i in range(self.pop_size):
-            thresholds = self.mean.detach() + self.sigma * noise[i]
-            waits = [total_wait(thresholds, self.v, self.e, self.steps, seed=s) for s in seeds]
+            thresholds = torch.clamp(self.mean.detach() + self.sigma * noise[i], min=0)
+            waits = [run_sim(self.graph, self.v, thresholds.tolist(), self.steps, seed=s)[0] for s in seeds]
             rewards[i] = -sum(waits) / len(waits)
-
         rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
-        grad_estimate = (noise * rewards.unsqueeze(1)).mean(dim=0) / self.sigma
-
+        grad = (noise * rewards.unsqueeze(1)).mean(dim=0) / self.sigma
         self.optimizer.zero_grad()
-        self.mean.grad = -grad_estimate  # ascend reward = descend -reward
+        self.mean.grad = -grad
         self.optimizer.step()
         with torch.no_grad():
             self.mean.clamp_(min=0)
-        return -rewards.mean().item()  # normalized, just for logging
+
+
+def optimize_for_graph(graph, v, epochs=15, **kwargs):
+    opt = ESOptimizer(graph, v, **kwargs)
+    for _ in range(epochs):
+        opt.step()
+    return opt.mean.detach().tolist()
 
 
 if __name__ == "__main__":
-    V, E = 10, 12
-    opt = ESOptimizer(v=V, e=E, lr=1.0, sigma=3.0, pop_size=30, steps=100)
-    for epoch in range(30):
-        opt.step(seeds=(10, 20, 30, 40, 50))
-        if (epoch + 1) % 5 == 0:
-            eval_wait = sum(total_wait(opt.mean.detach(), V, E, 100, seed=s) for s in range(100, 105)) / 5
-            print(f"epoch {epoch+1}: thresholds={opt.mean.detach().numpy().round(1)} "
-                  f"avg_eval_wait={eval_wait:.2f}")
+    V = 10
+    E = 12
+    EVAL_STEPS = 100       # timesteps for the final comparison run
+    ES_STEPS = 150          # timesteps per candidate during ES search (kept short for speed)
+    ES_EPOCHS = 150
+    NUM_GRAPHS = 5000
+
+    results = []
+    for g in range(NUM_GRAPHS):
+        random.seed(1000 + g)
+        graph = randomGraph(V, E)
+
+        random_thresholds = [random.uniform(0, 40) for _ in range(V)]
+        optimized_thresholds = optimize_for_graph(
+            graph, V, epochs=ES_EPOCHS, lr=1.0, sigma=3.0, pop_size=20, steps=ES_STEPS
+        )
+
+        eval_seed = 5000 + g  # same seed for both configs -> same car arrivals, fair comparison
+        wait_random, avg_random = run_sim(graph, V, random_thresholds, steps=EVAL_STEPS, seed=eval_seed)
+        wait_opt, avg_opt = run_sim(graph, V, optimized_thresholds, steps=EVAL_STEPS, seed=eval_seed)
+
+        improvement = 100 * (wait_random - wait_opt) / wait_random if wait_random else 0
+        results.append({
+            "graph": g, "graph_edges": graph,
+            "random_thresholds": random_thresholds,
+            "optimized_thresholds": optimized_thresholds,
+            "wait_random": wait_random, "wait_optimized": wait_opt,
+            "avg_wait_random": avg_random, "avg_wait_optimized": avg_opt,
+            "improvement_pct": improvement,
+        })
+        print(f"graph {g}: random={wait_random:.1f}  optimized={wait_opt:.1f}  "
+              f"improvement={improvement:.1f}%")
+
+    # with open("comparison_results.csv", "w", newline="") as f:
+    #     writer = csv.writer(f)
+    #     writer.writerow(["graph", "wait_random", "wait_optimized",
+    #                       "avg_wait_random", "avg_wait_optimized", "improvement_pct"])
+    #     for r in results:
+    #         writer.writerow([r["graph"], r["wait_random"], r["wait_optimized"],
+    #                           r["avg_wait_random"], r["avg_wait_optimized"], r["improvement_pct"]])
+
+    with open("comparison_details.txt", "w") as f:
+        for r in results:
+            f.write(f"Graph {r['graph']}\n")
+            f.write(f"  Edges: {r['graph_edges']}\n")
+            f.write(f"  Random thresholds:    {[round(t, 1) for t in r['random_thresholds']]}\n")
+            f.write(f"  Optimized thresholds: {[round(t, 1) for t in r['optimized_thresholds']]}\n")
+            f.write(f"  Total wait (random):    {r['wait_random']:.1f}\n")
+            f.write(f"  Total wait (optimized): {r['wait_optimized']:.1f}\n")
+            f.write(f"  Improvement: {r['improvement_pct']:.1f}%\n\n")
+
+    avg_improvement = sum(r["improvement_pct"] for r in results) / len(results)
+    print(f"\nAverage improvement across {NUM_GRAPHS} graphs: {avg_improvement:.1f}%")
+    print("Saved comparison_results.csv and comparison_details.txt")
