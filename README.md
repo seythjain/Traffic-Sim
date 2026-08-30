@@ -54,24 +54,40 @@ The simulation tracks total wait score across all intersections and calculates a
 
 ## Usage
 
+To run the simulation, modify the configuration variables in `main.py`:
+
+```python
+v = 10                  # Number of intersections
+e = 12                  # Number of connections
+threshold = 0           # Wait score threshold for switching lights
+carsMaxAdd = 3          # Maximum cars arriving per timestep (noise)
+```
+
+Then run:
 ```bash
 python main.py
 ```
 
 This will:
-1. Generate a random graph (10 vertices, 12 edges by default)
+1. Generate a random connected graph
 2. Run 1 million timesteps of simulation
 3. Output graphs to `graphs.txt`
 4. Print intersection and city-wide statistics
 
-## Configuration
+To test optimized thresholds, uncomment this line in `main.py`:
+```python
+# intersections = {i: IntersectionManyWay(id=i, threshold=optim_thresh[i]) for i in range(v)}
+```
 
-In `main.py`, you can adjust:
-- `v`: Number of intersections (vertices)
-- `e`: Number of connections (edges)
-- `threshold`: Wait score threshold for switching lights (default: 0)
-- `carsMaxAdd`: Maximum cars arriving per timestep (default: 3)
-- `optim_thresh`: Array of optimized thresholds per intersection (commented out)
+## Configuration Parameters
+
+- **v**: Number of intersections (vertices) in the network
+- **e**: Number of connections (edges) between intersections
+- **threshold**: Wait score threshold for traffic light switches (per intersection)
+  - Lower values = more frequent switching
+  - Higher values = longer red phases before switching
+- **carsMaxAdd**: Maximum random cars arriving per timestep per direction (adds noise/variability)
+- **optim_thresh**: Array of per-intersection optimized thresholds (for testing optimization results)
 
 ## Output Files
 
@@ -83,7 +99,7 @@ In `main.py`, you can adjust:
 
 The provided optimized thresholds in `main.py` show:
 - **Without optimization** (threshold=0): 1,426,331.69 total wait score
-- **With optimization**: 1,077,012.99 total wait score (~24% improvement)
+- **With optimization** (threshold=optim_thresh): 1,077,012.99 total wait score (~24% improvement)
 
 ## Requirements
 
